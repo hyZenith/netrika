@@ -1,12 +1,23 @@
 import fs from 'fs';
 import path from 'path';
-import type { CaseRecord, DRClass, ScreeningResult, PatientMetadata, ScreenerMetadata, CaseStatus } from '../ai/types';
+import { eq, desc } from 'drizzle-orm';
+import { db } from './drizzle';
+import { cases } from './schema';
+import type {
+  CaseRecord,
+  DRClass,
+  ScreeningResult,
+  PatientMetadata,
+  ScreenerMetadata,
+  CaseStatus,
+  SpecialistReview,
+} from '../ai/types';
 
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'cases.json');
 
 // Default pre-seeded test cases (all 3 initially PENDING_REVIEW as required)
-const defaultCases: CaseRecord[] = [
+export const defaultCases: CaseRecord[] = [
   {
     id: 'NET-2026-0001',
     caseStatus: 'PENDING_REVIEW',
@@ -126,6 +137,33 @@ const defaultCases: CaseRecord[] = [
   },
 ];
 
+// Helper to convert DB row to CaseRecord
+function mapDbRowToCaseRecord(row: typeof cases.$inferSelect): CaseRecord {
+  return {
+    id: row.id,
+    caseStatus: row.caseStatus as CaseStatus,
+    level: row.level,
+    drLevelNum: row.drLevelNum as DRClass,
+    drClassName: (row.drClassName as any) || undefined,
+    confidence: row.confidence,
+    status: row.status as 'Referable' | 'Non-referable',
+    priority: row.priority as any,
+    imageSrc: row.imageSrc,
+    originalImageSrc: row.originalImageSrc || undefined,
+    gradcamHeatmapSrc: row.gradcamHeatmapSrc || undefined,
+    gradcamOverlaySrc: row.gradcamOverlaySrc || undefined,
+    timestamp: row.timestamp.toISOString(),
+    patient: row.patient || undefined,
+    screener: row.screener || undefined,
+    quality: row.quality || undefined,
+    evidence: row.evidence || undefined,
+    ophthalmologistReview: row.ophthalmologistReview || undefined,
+  };
+}
+
+// ==========================================
+// FILE-BASED BACKUP & LOCAL CACHE
+// ==========================================
 function loadCasesFromFile(): CaseRecord[] {
   try {
     if (fs.existsSync(DB_FILE)) {
@@ -139,29 +177,66 @@ function loadCasesFromFile(): CaseRecord[] {
     console.error('Error reading cases file:', err);
   }
 
-  // If file doesn't exist or failed to load, write defaults
   saveCasesToFile(defaultCases);
   return [...defaultCases];
 }
 
-function saveCasesToFile(cases: CaseRecord[]): void {
+function saveCasesToFile(caseList: CaseRecord[]): void {
   try {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
-    fs.writeFileSync(DB_FILE, JSON.stringify(cases, null, 2), 'utf-8');
+    fs.writeFileSync(DB_FILE, JSON.stringify(caseList, null, 2), 'utf-8');
   } catch (err) {
     console.error('Error writing cases file:', err);
   }
 }
 
-// In-memory cache synced with disk file
 let cachedCases: CaseRecord[] = loadCasesFromFile();
+let hasSeededCasesPostgres = false;
 
-export function generateNextCaseId(): string {
-  const currentCases = getCases();
+async function ensureSeededCasesPostgres() {
+  if (!db || hasSeededCasesPostgres) return;
+  try {
+    const existing = await db.select({ id: cases.id }).from(cases).limit(1);
+    if (existing.length === 0) {
+      for (const c of defaultCases) {
+        await db.insert(cases).values({
+          id: c.id,
+          caseStatus: c.caseStatus,
+          level: c.level,
+          drLevelNum: c.drLevelNum,
+          drClassName: c.drClassName,
+          confidence: c.confidence,
+          status: c.status,
+          priority: c.priority,
+          imageSrc: c.imageSrc,
+          originalImageSrc: c.originalImageSrc,
+          gradcamHeatmapSrc: c.gradcamHeatmapSrc,
+          gradcamOverlaySrc: c.gradcamOverlaySrc,
+          timestamp: new Date(c.timestamp),
+          patient: c.patient,
+          screener: c.screener,
+          quality: c.quality,
+          evidence: c.evidence,
+          ophthalmologistReview: c.ophthalmologistReview,
+          createdAt: new Date(),
+        });
+      }
+    }
+    hasSeededCasesPostgres = true;
+  } catch (err) {
+    console.error('Notice: Auto-seeding Neon PostgreSQL cases deferred:', err);
+  }
+}
+
+/**
+ * Generates the next sequential clinical case ID (e.g. NET-2026-0004)
+ */
+export async function generateNextCaseId(): Promise<string> {
+  const allCases = await getCases();
   let maxNum = 0;
-  for (const c of currentCases) {
+  for (const c of allCases) {
     const match = c.id.match(/^NET-2026-(\d+)$/i);
     if (match) {
       const num = parseInt(match[1], 10);
@@ -174,29 +249,60 @@ export function generateNextCaseId(): string {
   return `NET-2026-${String(nextNum).padStart(4, '0')}`;
 }
 
-export function getCases(): CaseRecord[] {
+/**
+ * Retrieves all cases sorted with most recent first
+ */
+export async function getCases(): Promise<CaseRecord[]> {
+  if (db) {
+    try {
+      await ensureSeededCasesPostgres();
+      const records = await db.select().from(cases).orderBy(desc(cases.createdAt));
+      if (records.length > 0) {
+        return records.map(mapDbRowToCaseRecord);
+      }
+    } catch (err) {
+      console.warn('Neon DB query error in getCases, falling back to local file store:', err);
+    }
+  }
+
   cachedCases = loadCasesFromFile();
   return [...cachedCases];
 }
 
-export function getCaseById(id: string): CaseRecord | undefined {
-  const current = getCases();
+/**
+ * Retrieves single case by ID
+ */
+export async function getCaseById(id: string): Promise<CaseRecord | undefined> {
+  if (db) {
+    try {
+      await ensureSeededCasesPostgres();
+      const records = await db.select().from(cases).where(eq(cases.id, id)).limit(1);
+      if (records.length > 0) {
+        return mapDbRowToCaseRecord(records[0]);
+      }
+      return undefined;
+    } catch (err) {
+      console.warn('Neon DB query error in getCaseById:', err);
+    }
+  }
+
+  const current = await getCases();
   return current.find((c) => c.id === id);
 }
 
-export function addCaseFromScreening(
+/**
+ * Adds a new case to database from an AI screening result
+ */
+export async function addCaseFromScreening(
   result: ScreeningResult,
   patient?: PatientMetadata,
   screener?: ScreenerMetadata,
   initialStatus: CaseStatus = 'PENDING_REVIEW'
-): CaseRecord {
-  const current = getCases();
-  const existingIdx = current.findIndex((c) => c.id === result.caseId);
-
+): Promise<CaseRecord> {
   const assignedId =
     result.caseId && result.caseId.startsWith('NET-2026-')
       ? result.caseId
-      : generateNextCaseId();
+      : await generateNextCaseId();
 
   const newCase: CaseRecord = {
     id: assignedId,
@@ -229,23 +335,75 @@ export function addCaseFromScreening(
     },
   };
 
-  if (existingIdx >= 0) {
-    current[existingIdx] = { ...current[existingIdx], ...newCase };
-    saveCasesToFile(current);
-    cachedCases = current;
-    return current[existingIdx];
+  if (db) {
+    try {
+      await ensureSeededCasesPostgres();
+      const existing = await db.select({ id: cases.id }).from(cases).where(eq(cases.id, assignedId)).limit(1);
+
+      if (existing.length > 0) {
+        await db.update(cases).set({
+          caseStatus: newCase.caseStatus,
+          level: newCase.level,
+          drLevelNum: newCase.drLevelNum,
+          drClassName: newCase.drClassName,
+          confidence: newCase.confidence,
+          status: newCase.status,
+          priority: newCase.priority,
+          imageSrc: newCase.imageSrc,
+          originalImageSrc: newCase.originalImageSrc,
+          gradcamHeatmapSrc: newCase.gradcamHeatmapSrc,
+          gradcamOverlaySrc: newCase.gradcamOverlaySrc,
+          patient: newCase.patient,
+          screener: newCase.screener,
+          quality: newCase.quality,
+          evidence: newCase.evidence,
+        }).where(eq(cases.id, assignedId));
+      } else {
+        await db.insert(cases).values({
+          id: newCase.id,
+          caseStatus: newCase.caseStatus,
+          level: newCase.level,
+          drLevelNum: newCase.drLevelNum,
+          drClassName: newCase.drClassName,
+          confidence: newCase.confidence,
+          status: newCase.status,
+          priority: newCase.priority,
+          imageSrc: newCase.imageSrc,
+          originalImageSrc: newCase.originalImageSrc,
+          gradcamHeatmapSrc: newCase.gradcamHeatmapSrc,
+          gradcamOverlaySrc: newCase.gradcamOverlaySrc,
+          timestamp: new Date(newCase.timestamp),
+          patient: newCase.patient,
+          screener: newCase.screener,
+          quality: newCase.quality,
+          evidence: newCase.evidence,
+          createdAt: new Date(),
+        });
+      }
+    } catch (err) {
+      console.error('Failed to insert case into Neon PostgreSQL, syncing to disk:', err);
+    }
   }
 
-  // Prepend to top of list
-  current.unshift(newCase);
-  if (current.length > 200) current.pop();
-
+  // Also sync locally to cases.json
+  const current = loadCasesFromFile();
+  const existingIdx = current.findIndex((c) => c.id === assignedId);
+  if (existingIdx >= 0) {
+    current[existingIdx] = { ...current[existingIdx], ...newCase };
+  } else {
+    current.unshift(newCase);
+    if (current.length > 200) current.pop();
+  }
   saveCasesToFile(current);
   cachedCases = current;
+
   return newCase;
 }
 
-export function submitOphthalmologistReview(
+/**
+ * Submits an ophthalmologist tele-review for a case
+ */
+export async function submitOphthalmologistReview(
   caseId: string,
   review: {
     finalDRLevel: DRClass;
@@ -255,17 +413,8 @@ export function submitOphthalmologistReview(
     hospitalAffiliation?: string;
     referralRecommendation?: 'Routine 12m' | 'Early 3-6m' | 'Laser / Anti-VEGF Specialist Referral' | 'Emergency Referral';
   }
-): CaseRecord | null {
-  const current = getCases();
-  const c = current.find((item) => item.id === caseId);
-  if (!c) return null;
-
-  c.drLevelNum = review.finalDRLevel;
-  c.level = `Level ${review.finalDRLevel}`;
-  c.status = review.finalDRLevel >= 2 ? 'Referable' : 'Non-referable';
-  c.caseStatus = 'REVIEWED';
-  c.priority = 'Reviewed';
-  c.ophthalmologistReview = {
+): Promise<CaseRecord | null> {
+  const specialistReview: SpecialistReview = {
     reviewedAt: new Date().toISOString(),
     finalDRLevel: review.finalDRLevel,
     clinicalNotes: review.clinicalNotes,
@@ -275,16 +424,64 @@ export function submitOphthalmologistReview(
     referralRecommendation: review.referralRecommendation || (review.finalDRLevel >= 2 ? 'Laser / Anti-VEGF Specialist Referral' : 'Routine 12m'),
   };
 
+  const newLevel = `Level ${review.finalDRLevel}`;
+  const newStatus = review.finalDRLevel >= 2 ? 'Referable' : 'Non-referable';
+
+  if (db) {
+    try {
+      await ensureSeededCasesPostgres();
+      const updated = await db
+        .update(cases)
+        .set({
+          drLevelNum: review.finalDRLevel,
+          level: newLevel,
+          status: newStatus,
+          caseStatus: 'REVIEWED',
+          priority: 'Reviewed',
+          ophthalmologistReview: specialistReview,
+        })
+        .where(eq(cases.id, caseId))
+        .returning();
+
+      if (updated.length > 0) {
+        return mapDbRowToCaseRecord(updated[0]);
+      }
+    } catch (err) {
+      console.error('Neon DB update error in submitOphthalmologistReview:', err);
+    }
+  }
+
+  // Local fallback
+  const current = loadCasesFromFile();
+  const c = current.find((item) => item.id === caseId);
+  if (!c) return null;
+
+  c.drLevelNum = review.finalDRLevel;
+  c.level = newLevel;
+  c.status = newStatus;
+  c.caseStatus = 'REVIEWED';
+  c.priority = 'Reviewed';
+  c.ophthalmologistReview = specialistReview;
+
   saveCasesToFile(current);
   cachedCases = current;
   return c;
 }
 
-export function getScreeningStats() {
-  const current = getCases();
+/**
+ * Calculates current screening surveillance KPIs
+ */
+export async function getScreeningStats() {
+  const current = await getCases();
   const total = current.length + 21; // Base offset for demo continuity
   const referable = current.filter((c) => c.status === 'Referable').length + 3;
-  const pending = current.filter((c) => c.caseStatus === 'PENDING_REVIEW' || c.priority === 'Pending Ophthalmologist Review' || c.priority === 'Pending' || c.priority === 'High priority').length;
+  const pending = current.filter(
+    (c) =>
+      c.caseStatus === 'PENDING_REVIEW' ||
+      c.priority === 'Pending Ophthalmologist Review' ||
+      c.priority === 'Pending' ||
+      c.priority === 'High priority'
+  ).length;
   const ungradable = 2;
 
   return {
