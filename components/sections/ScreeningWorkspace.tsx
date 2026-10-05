@@ -27,6 +27,7 @@ import {
   CircleDot,
   Sun,
   FileText,
+  Activity,
 } from 'lucide-react'
 import { RetinaVisual, type ViewMode } from '@/components/common/RetinaVisual'
 import type { ScreeningResult, CaseRecord, DRClass, EvidenceItem } from '@/lib/ai/types'
