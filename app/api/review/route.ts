@@ -5,9 +5,17 @@ import type { DRClass } from '@/lib/ai/types';
 export const runtime = 'nodejs';
 
 export async function GET() {
-  const cases = getCases();
-  const stats = getScreeningStats();
-  return NextResponse.json({ success: true, cases, stats });
+  try {
+    const cases = await getCases();
+    const stats = await getScreeningStats();
+    return NextResponse.json({ success: true, cases, stats });
+  } catch (error: any) {
+    console.error('Review API GET error:', error);
+    return NextResponse.json(
+      { success: false, error: error.message || 'Failed to retrieve cases' },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -30,7 +38,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const updatedCase = submitOphthalmologistReview(caseId, {
+    const updatedCase = await submitOphthalmologistReview(caseId, {
       finalDRLevel: Number(finalDRLevel) as DRClass,
       clinicalNotes: clinicalNotes || '',
       reviewerName,
@@ -46,8 +54,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const cases = getCases();
-    const stats = getScreeningStats();
+    const cases = await getCases();
+    const stats = await getScreeningStats();
 
     return NextResponse.json({
       success: true,
@@ -56,7 +64,7 @@ export async function POST(req: NextRequest) {
       stats,
     });
   } catch (error: any) {
-    console.error('Review API error:', error);
+    console.error('Review API POST error:', error);
     return NextResponse.json(
       { success: false, error: error.message || 'Failed to submit review' },
       { status: 500 }

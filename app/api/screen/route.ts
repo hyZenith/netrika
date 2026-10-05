@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { runScreeningPipeline } from '@/lib/ai/pipeline';
 import { addCaseFromScreening, generateNextCaseId } from '@/lib/db/caseStore';
+import { uploadMedicalImage } from '@/lib/upload/cloudinary';
 
 export const runtime = 'nodejs';
 
@@ -72,15 +73,44 @@ export async function POST(req: NextRequest) {
     }
 
     // Generate unique sequential case ID (e.g. NET-2026-0004)
-    const nextCaseId = generateNextCaseId();
+    const nextCaseId = await generateNextCaseId();
 
     // Run complete AI Pipeline
     const result = await runScreeningPipeline(imageBuffer, { caseId: nextCaseId });
 
+    // Upload processed images to Cloudinary (or fallback to data URLs if Cloudinary not set)
+    if (result.imageSrc) {
+      const uploadedMainUrl = await uploadMedicalImage(
+        result.imageSrc,
+        'fundus-scans',
+        `${nextCaseId}-normalized`
+      );
+      result.imageSrc = uploadedMainUrl;
+      result.originalImageSrc = uploadedMainUrl;
+    }
+
+    if (result.gradcam?.heatmapDataUrl) {
+      const uploadedHeatmapUrl = await uploadMedicalImage(
+        result.gradcam.heatmapDataUrl,
+        'gradcam-heatmaps',
+        `${nextCaseId}-heatmap`
+      );
+      result.gradcam.heatmapDataUrl = uploadedHeatmapUrl;
+    }
+
+    if (result.gradcam?.overlayDataUrl) {
+      const uploadedOverlayUrl = await uploadMedicalImage(
+        result.gradcam.overlayDataUrl,
+        'gradcam-overlays',
+        `${nextCaseId}-overlay`
+      );
+      result.gradcam.overlayDataUrl = uploadedOverlayUrl;
+    }
+
     // Save into case database with PENDING_REVIEW only if image quality is gradable
     let savedCase = null;
     if (result.quality.isGradable) {
-      savedCase = addCaseFromScreening(result, patientData, screenerData, 'PENDING_REVIEW');
+      savedCase = await addCaseFromScreening(result, patientData, screenerData, 'PENDING_REVIEW');
     }
 
     return NextResponse.json({

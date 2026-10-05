@@ -5,10 +5,13 @@ import {
   getUsers,
   type UserRole,
 } from '@/lib/db/userStore';
+import { createSession } from '@/lib/auth/session';
+
+export const runtime = 'nodejs';
 
 export async function GET() {
   try {
-    const users = getUsers();
+    const users = await getUsers();
     return NextResponse.json({ success: true, users });
   } catch (error: any) {
     return NextResponse.json(
@@ -31,7 +34,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const res = registerUser({
+      const res = await registerUser({
         name: body.name,
         email,
         password: password || 'password123',
@@ -46,9 +49,12 @@ export async function POST(req: NextRequest) {
         designation: body.designation,
       });
 
-      if (!res.success) {
+      if (!res.success || !res.user) {
         return NextResponse.json({ success: false, error: res.error }, { status: 400 });
       }
+
+      // Establish secure stateless session cookie
+      await createSession(res.user);
 
       return NextResponse.json({
         success: true,
@@ -65,10 +71,13 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const res = authenticateUser(email, password, role as UserRole | undefined);
-      if (!res.success) {
+      const res = await authenticateUser(email, password, role as UserRole | undefined);
+      if (!res.success || !res.user) {
         return NextResponse.json({ success: false, error: res.error }, { status: 401 });
       }
+
+      // Establish secure stateless session cookie
+      await createSession(res.user);
 
       return NextResponse.json({
         success: true,

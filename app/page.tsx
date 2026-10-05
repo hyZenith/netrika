@@ -19,29 +19,51 @@ export default function Home() {
   const [user, setUser] = useState<UserProfile | null>(null)
   const [selectedCase, setSelectedCase] = useState<CaseRecord | null>(null)
 
-  // Restore saved session from localStorage on mount
+  // Restore saved session from server (/api/auth/me) with localStorage fallback on mount
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('netrika_user')
-      if (saved) {
-        setUser(JSON.parse(saved))
-      } else {
-        // Default to Technician for screening role by default
-        const defaultTechnician: UserProfile = {
-          id: 'usr-tech-01',
-          name: 'Anjali Devi',
-          email: 'anjali.devi@ruralhealth.gov.in',
-          role: 'Technician',
-          operatorId: 'TECH-AS-401',
-          centerName: 'Sonitpur Rural Vision Centre / PHC',
-          district: 'Sonitpur, Assam',
-          createdAt: new Date().toISOString(),
+    let isMounted = true
+
+    async function checkServerSession() {
+      try {
+        const res = await fetch('/api/auth/me')
+        const data = await res.json()
+        if (isMounted && data.authenticated && data.user) {
+          setUser(data.user)
+          localStorage.setItem('netrika_user', JSON.stringify(data.user))
+          return
         }
-        setUser(defaultTechnician)
-        localStorage.setItem('netrika_user', JSON.stringify(defaultTechnician))
+      } catch (err) {
+        console.warn('Could not verify server session:', err)
       }
-    } catch (e) {
-      console.log('Session restore error:', e)
+
+      // LocalStorage fallback
+      try {
+        const saved = localStorage.getItem('netrika_user')
+        if (saved && isMounted) {
+          setUser(JSON.parse(saved))
+        } else if (isMounted) {
+          // Default to Technician for screening role by default
+          const defaultTechnician: UserProfile = {
+            id: 'usr-tech-01',
+            name: 'Anjali Devi',
+            email: 'anjali.devi@ruralhealth.gov.in',
+            role: 'Technician',
+            operatorId: 'TECH-AS-401',
+            centerName: 'Sonitpur Rural Vision Centre / PHC',
+            district: 'Sonitpur, Assam',
+            createdAt: new Date().toISOString(),
+          }
+          setUser(defaultTechnician)
+          localStorage.setItem('netrika_user', JSON.stringify(defaultTechnician))
+        }
+      } catch (e) {
+        console.log('Session restore error:', e)
+      }
+    }
+
+    checkServerSession()
+    return () => {
+      isMounted = false
     }
   }, [])
 
@@ -52,10 +74,11 @@ export default function Home() {
     } catch (e) {}
   }
 
-  const handleUserLogout = () => {
+  const handleUserLogout = async () => {
     setUser(null)
     try {
       localStorage.removeItem('netrika_user')
+      await fetch('/api/auth/logout', { method: 'POST' })
     } catch (e) {}
   }
 
